@@ -1,0 +1,16 @@
+[package]
+name = "epq"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = "0.29"
+wgpu = { version = "0.19", features = ["spirv"] }
+glam = "0.24" # consider .25?
+tokio = { version = "1.35", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+shared = { path = "shared" }
+
+[build-dependencies]
+spirv-builder = "0.9"
