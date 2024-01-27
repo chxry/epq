@@ -1,7 +1,9 @@
 #![no_std]
-use glam::Vec2;
+use glam::UVec2;
 
+#[repr(C, align(16))]
 #[derive(Default)]
 pub struct Consts {
-  pub size: Vec2,
+  pub size: UVec2,
+  pub samples: u32,
 }

@@ -2,9 +2,11 @@ use std::{mem, slice};
 use winit::event_loop::EventLoop;
 use winit::event::{Event, WindowEvent};
 use winit::window::WindowBuilder;
-use tracing_subscriber::prelude::*;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::filter::LevelFilter;
-use glam::Vec2;
+use glam::UVec2;
 use shared::Consts;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -64,28 +66,21 @@ async fn main() -> Result {
       count: None,
     }],
   });
-
-  let shader = device.create_shader_module(wgpu::include_spirv!(env!("shaders.spv")));
-
-  let rt_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+  let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
     label: None,
     bind_group_layouts: &[&tex_layout, &uniform_layout],
     push_constant_ranges: &[],
   });
-  let rt_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-    layout: Some(&rt_pipeline_layout),
-    module: &shader,
-    entry_point: "rt_main",
-    label: None,
-  });
 
-  let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+  let shader = device.create_shader_module(wgpu::include_spirv!(env!("shaders.spv")));
+  let rt_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+    layout: Some(&pipeline_layout),
+    module: &shader,
+    entry_point: "rt::main",
     label: None,
-    bind_group_layouts: &[&tex_layout],
-    push_constant_ranges: &[],
   });
   let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-    layout: Some(&ui_pipeline_layout),
+    layout: Some(&pipeline_layout),
     vertex: wgpu::VertexState {
       module: &shader,
       entry_point: "quad_v",
@@ -95,7 +90,7 @@ async fn main() -> Result {
       module: &shader,
       entry_point: "test_f",
       targets: &[Some(wgpu::ColorTargetState {
-        format: wgpu::TextureFormat::Bgra8Unorm,
+        format: wgpu::TextureFormat::Bgra8UnormSrgb,
         blend: None,
         write_mask: wgpu::ColorWrites::ALL,
       })],
@@ -108,21 +103,7 @@ async fn main() -> Result {
   });
 
   let mut framebuffer = Framebuffer::new(&device, 1, 1, &tex_layout);
-  let mut consts = Consts::default();
-  let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-    size: mem::size_of::<Consts>() as _,
-    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    mapped_at_creation: false,
-    label: None,
-  });
-  let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-    layout: &uniform_layout,
-    entries: &[wgpu::BindGroupEntry {
-      binding: 0,
-      resource: uniform_buf.as_entire_binding(),
-    }],
-    label: None,
-  });
+  let mut uniform = Uniform::new(&device, &uniform_layout);
 
   let window = &window;
   event_loop.run(move |event, elwt| match event {
@@ -132,17 +113,18 @@ async fn main() -> Result {
           &device,
           &wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: wgpu::TextureFormat::Bgra8Unorm,
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::Immediate,
+            present_mode: wgpu::PresentMode::AutoNoVsync,
             desired_maximum_frame_latency: 1,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
           },
         );
         framebuffer = Framebuffer::new(&device, size.width, size.height, &tex_layout);
-        consts.size = Vec2::new(size.width as _, size.height as _);
+        uniform.data.size = UVec2::new(size.width, size.height);
+        uniform.data.samples = 1;
       }
       WindowEvent::RedrawRequested => {
         let surface = surface.get_current_texture().unwrap();
@@ -151,7 +133,7 @@ async fn main() -> Result {
           .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-        queue.write_buffer(&uniform_buf, 0, cast(&consts));
+        uniform.update(&queue);
 
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
           label: None,
@@ -159,8 +141,9 @@ async fn main() -> Result {
         });
         compute_pass.set_pipeline(&rt_pipeline);
         compute_pass.set_bind_group(0, &framebuffer.bind_group, &[]);
-        compute_pass.set_bind_group(1, &uniform_bind_group, &[]);
+        compute_pass.set_bind_group(1, &uniform.bind_group, &[]);
         compute_pass.dispatch_workgroups(framebuffer.tex.width(), framebuffer.tex.height(), 1);
+        uniform.data.samples += 1;
         drop(compute_pass);
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -179,6 +162,7 @@ async fn main() -> Result {
         });
         render_pass.set_pipeline(&ui_pipeline);
         render_pass.set_bind_group(0, &framebuffer.bind_group, &[]);
+        render_pass.set_bind_group(1, &uniform.bind_group, &[]);
         render_pass.draw(0..3, 0..1);
         drop(render_pass);
 
@@ -196,7 +180,6 @@ async fn main() -> Result {
 
 struct Framebuffer {
   tex: wgpu::Texture,
-  view: wgpu::TextureView,
   bind_group: wgpu::BindGroup,
 }
 
@@ -225,11 +208,42 @@ impl Framebuffer {
       }],
       label: None,
     });
+    Self { tex, bind_group }
+  }
+}
+
+struct Uniform {
+  data: Consts,
+  buf: wgpu::Buffer,
+  bind_group: wgpu::BindGroup,
+}
+
+impl Uniform {
+  fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> Self {
+    let data = Consts::default();
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+      size: mem::size_of::<Consts>() as _,
+      usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+      mapped_at_creation: false,
+      label: None,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+      layout,
+      entries: &[wgpu::BindGroupEntry {
+        binding: 0,
+        resource: buf.as_entire_binding(),
+      }],
+      label: None,
+    });
     Self {
-      tex,
-      view,
+      data,
+      buf,
       bind_group,
     }
+  }
+
+  fn update(&self, queue: &wgpu::Queue) {
+    queue.write_buffer(&self.buf, 0, cast(&self.data));
   }
 }
 
