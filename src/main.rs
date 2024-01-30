@@ -2,11 +2,14 @@ use std::{mem, slice};
 use winit::event_loop::EventLoop;
 use winit::event::{Event, WindowEvent};
 use winit::window::WindowBuilder;
+use wgpu::util::DeviceExt;
+use tracing::info;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::filter::LevelFilter;
-use glam::UVec2;
+use glam::{UVec2, Vec4};
+use rand::Rng;
 use shared::Consts;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -41,7 +44,6 @@ async fn main() -> Result {
     .await?;
 
   let tex_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-    label: None,
     entries: &[wgpu::BindGroupLayoutEntry {
       binding: 0,
       visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT,
@@ -52,9 +54,9 @@ async fn main() -> Result {
       },
       count: None,
     }],
+    label: None,
   });
   let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-    label: None,
     entries: &[wgpu::BindGroupLayoutEntry {
       binding: 0,
       visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT,
@@ -65,22 +67,55 @@ async fn main() -> Result {
       },
       count: None,
     }],
-  });
-  let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
     label: None,
-    bind_group_layouts: &[&tex_layout, &uniform_layout],
-    push_constant_ranges: &[],
+  });
+  let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+    entries: &[
+      wgpu::BindGroupLayoutEntry {
+        binding: 1,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+          ty: wgpu::BufferBindingType::Storage { read_only: true },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+      wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+          ty: wgpu::BufferBindingType::Storage { read_only: true },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+    ],
+    label: None,
   });
 
   let shader = device.create_shader_module(wgpu::include_spirv!(env!("shaders.spv")));
+
+  let rt_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+    bind_group_layouts: &[&tex_layout, &uniform_layout, &scene_layout],
+    push_constant_ranges: &[],
+    label: None,
+  });
   let rt_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-    layout: Some(&pipeline_layout),
+    layout: Some(&rt_pipeline_layout),
     module: &shader,
     entry_point: "rt::main",
     label: None,
   });
+
+  let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+    bind_group_layouts: &[&tex_layout, &uniform_layout],
+    push_constant_ranges: &[],
+    label: None,
+  });
   let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-    layout: Some(&pipeline_layout),
+    layout: Some(&ui_pipeline_layout),
     vertex: wgpu::VertexState {
       module: &shader,
       entry_point: "quad_v",
@@ -105,6 +140,51 @@ async fn main() -> Result {
   let mut framebuffer = Framebuffer::new(&device, 1, 1, &tex_layout);
   let mut uniform = Uniform::new(&device, &uniform_layout);
 
+  let mut rng = rand::thread_rng();
+  let mut materials = vec![Vec4::new(0.5, 0.5, 0.5, 0.0)];
+  const MATS: usize = 10;
+  for _ in 0..MATS {
+    materials.push(Vec4::new(rng.gen(), rng.gen(), rng.gen(), 1.0));
+  }
+  let mut spheres = vec![
+    Vec4::new(0.0, -101.0, 0.0, 100.0),
+    Vec4::new(0.0, 0.0, 0.0, 0.0),
+  ];
+  for _ in 0..100 {
+    spheres.push(Vec4::new(
+      rng.gen_range(-10.0..10.0),
+      rng.gen_range(-1.0..5.0),
+      rng.gen_range(-10.0..2.0),
+      rng.gen_range(0.5..1.0),
+    ));
+    spheres.push(Vec4::new(rng.gen_range(0..=MATS) as f32, 0.0, 0.0, 0.0))
+  }
+
+  let materials_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    contents: cast_slice(&materials),
+    usage: wgpu::BufferUsages::STORAGE,
+    label: None,
+  });
+  let spheres_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    contents: cast_slice(&spheres),
+    usage: wgpu::BufferUsages::STORAGE,
+    label: None,
+  });
+  let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    layout: &scene_layout,
+    entries: &[
+      wgpu::BindGroupEntry {
+        binding: 0,
+        resource: materials_buf.as_entire_binding(),
+      },
+      wgpu::BindGroupEntry {
+        binding: 1,
+        resource: spheres_buf.as_entire_binding(),
+      },
+    ],
+    label: None,
+  });
+
   let window = &window;
   event_loop.run(move |event, elwt| match event {
     Event::WindowEvent { event, .. } => match event {
@@ -116,7 +196,7 @@ async fn main() -> Result {
             format: wgpu::TextureFormat::Bgra8UnormSrgb,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::AutoNoVsync,
+            present_mode: wgpu::PresentMode::Immediate,
             desired_maximum_frame_latency: 1,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
@@ -127,6 +207,7 @@ async fn main() -> Result {
         uniform.data.samples = 1;
       }
       WindowEvent::RedrawRequested => {
+        info!("{}", uniform.data.samples);
         let surface = surface.get_current_texture().unwrap();
         let surface_view = surface
           .texture
@@ -136,12 +217,13 @@ async fn main() -> Result {
         uniform.update(&queue);
 
         let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-          label: None,
           timestamp_writes: None,
+          label: None,
         });
         compute_pass.set_pipeline(&rt_pipeline);
         compute_pass.set_bind_group(0, &framebuffer.bind_group, &[]);
         compute_pass.set_bind_group(1, &uniform.bind_group, &[]);
+        compute_pass.set_bind_group(2, &scene_bind_group, &[]);
         compute_pass.dispatch_workgroups(framebuffer.tex.width(), framebuffer.tex.height(), 1);
         uniform.data.samples += 1;
         drop(compute_pass);
@@ -168,6 +250,7 @@ async fn main() -> Result {
 
         queue.submit([encoder.finish()]);
         surface.present();
+        instance.poll_all(true);
       }
       WindowEvent::CloseRequested => elwt.exit(),
       _ => {}

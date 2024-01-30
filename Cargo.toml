@@ -10,6 +10,7 @@ glam = "0.24"
 tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+rand = "0.8"
 shared = { path = "shared" }
 
 [build-dependencies]
