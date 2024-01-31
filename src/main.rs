@@ -72,6 +72,16 @@ async fn main() -> Result {
   let scene_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
     entries: &[
       wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+          ty: wgpu::BufferBindingType::Storage { read_only: true },
+          has_dynamic_offset: false,
+          min_binding_size: None,
+        },
+        count: None,
+      },
+      wgpu::BindGroupLayoutEntry {
         binding: 1,
         visibility: wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::Buffer {
@@ -82,23 +92,32 @@ async fn main() -> Result {
         count: None,
       },
       wgpu::BindGroupLayoutEntry {
-        binding: 0,
+        binding: 2,
         visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-          ty: wgpu::BufferBindingType::Storage { read_only: true },
-          has_dynamic_offset: false,
-          min_binding_size: None,
+        ty: wgpu::BindingType::Texture {
+          sample_type: wgpu::TextureSampleType::Float { filterable: false },
+          multisampled: false,
+          view_dimension: wgpu::TextureViewDimension::D2,
         },
         count: None,
       },
     ],
     label: None,
   });
+  let sampler_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+    entries: &[wgpu::BindGroupLayoutEntry {
+      binding: 0,
+      visibility: wgpu::ShaderStages::COMPUTE,
+      ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+      count: None,
+    }],
+    label: None,
+  });
 
   let shader = device.create_shader_module(wgpu::include_spirv!(env!("shaders.spv")));
 
   let rt_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-    bind_group_layouts: &[&tex_layout, &uniform_layout, &scene_layout],
+    bind_group_layouts: &[&tex_layout, &uniform_layout, &scene_layout, &sampler_layout],
     push_constant_ranges: &[],
     label: None,
   });
@@ -110,7 +129,7 @@ async fn main() -> Result {
   });
 
   let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-    bind_group_layouts: &[&tex_layout, &uniform_layout],
+    bind_group_layouts: &[&tex_layout],
     push_constant_ranges: &[],
     label: None,
   });
@@ -125,7 +144,7 @@ async fn main() -> Result {
       module: &shader,
       entry_point: "test_f",
       targets: &[Some(wgpu::ColorTargetState {
-        format: wgpu::TextureFormat::Bgra8UnormSrgb,
+        format: wgpu::TextureFormat::Bgra8Unorm,
         blend: None,
         write_mask: wgpu::ColorWrites::ALL,
       })],
@@ -142,23 +161,25 @@ async fn main() -> Result {
 
   let mut rng = rand::thread_rng();
   let mut materials = vec![Vec4::new(0.5, 0.5, 0.5, 0.0)];
-  const MATS: usize = 10;
-  for _ in 0..MATS {
-    materials.push(Vec4::new(rng.gen(), rng.gen(), rng.gen(), 1.0));
-  }
+  // const MATS: usize = 10;
+  // for _ in 0..MATS {
+  //   materials.push(Vec4::new(rng.gen(), rng.gen(), rng.gen(), 1.0));
+  // }
   let mut spheres = vec![
-    Vec4::new(0.0, -101.0, 0.0, 100.0),
+    Vec4::new(0.0, -101.0, -2.0, 100.0),
+    Vec4::new(0.0, 0.0, 0.0, 0.0),
+    Vec4::new(0.0, 0.0, -2.0, 1.0),
     Vec4::new(0.0, 0.0, 0.0, 0.0),
   ];
-  for _ in 0..100 {
-    spheres.push(Vec4::new(
-      rng.gen_range(-10.0..10.0),
-      rng.gen_range(-1.0..5.0),
-      rng.gen_range(-10.0..2.0),
-      rng.gen_range(0.5..1.0),
-    ));
-    spheres.push(Vec4::new(rng.gen_range(0..=MATS) as f32, 0.0, 0.0, 0.0))
-  }
+  // for _ in 0..100 {
+  //   spheres.push(Vec4::new(
+  //     rng.gen_range(-10.0..10.0),
+  //     rng.gen_range(-1.0..5.0),
+  //     rng.gen_range(-10.0..2.0),
+  //     rng.gen_range(0.5..1.0),
+  //   ));
+  //   spheres.push(Vec4::new(rng.gen_range(0..=MATS) as f32, 0.0, 0.0, 0.0))
+  // }
 
   let materials_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
     contents: cast_slice(&materials),
@@ -170,6 +191,27 @@ async fn main() -> Result {
     usage: wgpu::BufferUsages::STORAGE,
     label: None,
   });
+  let sky_img = image::open("wasteland_clouds_puresky_4k.exr")?.to_rgba32f();
+  let sky_tex = device.create_texture_with_data(
+    &queue,
+    &wgpu::TextureDescriptor {
+      size: wgpu::Extent3d {
+        width: sky_img.width(),
+        height: sky_img.height(),
+        depth_or_array_layers: 1,
+      },
+      mip_level_count: 1,
+      sample_count: 1,
+      dimension: wgpu::TextureDimension::D2,
+      format: wgpu::TextureFormat::Rgba32Float,
+      usage: wgpu::TextureUsages::TEXTURE_BINDING,
+      label: None,
+      view_formats: &[],
+    },
+    wgpu::util::TextureDataOrder::LayerMajor,
+    cast_slice(&sky_img.as_raw()),
+  );
+  let sky_view = sky_tex.create_view(&wgpu::TextureViewDescriptor::default());
   let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
     layout: &scene_layout,
     entries: &[
@@ -181,7 +223,21 @@ async fn main() -> Result {
         binding: 1,
         resource: spheres_buf.as_entire_binding(),
       },
+      wgpu::BindGroupEntry {
+        binding: 2,
+        resource: wgpu::BindingResource::TextureView(&sky_view),
+      },
     ],
+    label: None,
+  });
+
+  let sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+  let sampler_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    layout: &sampler_layout,
+    entries: &[wgpu::BindGroupEntry {
+      binding: 0,
+      resource: wgpu::BindingResource::Sampler(&sampler),
+    }],
     label: None,
   });
 
@@ -193,7 +249,7 @@ async fn main() -> Result {
           &device,
           &wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: wgpu::TextureFormat::Bgra8UnormSrgb,
+            format: wgpu::TextureFormat::Bgra8Unorm,
             width: size.width,
             height: size.height,
             present_mode: wgpu::PresentMode::Immediate,
@@ -224,7 +280,12 @@ async fn main() -> Result {
         compute_pass.set_bind_group(0, &framebuffer.bind_group, &[]);
         compute_pass.set_bind_group(1, &uniform.bind_group, &[]);
         compute_pass.set_bind_group(2, &scene_bind_group, &[]);
-        compute_pass.dispatch_workgroups(framebuffer.tex.width(), framebuffer.tex.height(), 1);
+        compute_pass.set_bind_group(3, &sampler_bind_group, &[]);
+        compute_pass.dispatch_workgroups(
+          framebuffer.tex.width() / 16,
+          framebuffer.tex.height() / 16,
+          1,
+        );
         uniform.data.samples += 1;
         drop(compute_pass);
 
@@ -244,7 +305,6 @@ async fn main() -> Result {
         });
         render_pass.set_pipeline(&ui_pipeline);
         render_pass.set_bind_group(0, &framebuffer.bind_group, &[]);
-        render_pass.set_bind_group(1, &uniform.bind_group, &[]);
         render_pass.draw(0..3, 0..1);
         drop(render_pass);
 

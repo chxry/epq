@@ -1,6 +1,7 @@
 use core::ops::Range;
-use core::f32::consts::PI;
-use spirv_std::spirv;
+use core::f32::consts::{PI, FRAC_1_PI};
+use spirv_std::{spirv, Sampler};
+use spirv_std::image::Image2d;
 use spirv_std::num_traits::Float;
 use spirv_std::glam::{UVec3, Vec4, Vec3, Vec2};
 use shared::Consts;
@@ -8,18 +9,21 @@ use crate::StorageImage;
 
 const MAX_BOUNCES: u32 = 16;
 
-#[spirv(compute(threads(1)))]
+#[spirv(compute(threads(16, 16)))]
 pub fn main(
   #[spirv(global_invocation_id)] id: UVec3,
   #[spirv(descriptor_set = 0, binding = 0)] tex: &StorageImage,
   #[spirv(uniform, descriptor_set = 1, binding = 0)] consts: &Consts,
   #[spirv(storage_buffer, descriptor_set = 2, binding = 0)] materials: &[Vec4],
   #[spirv(storage_buffer, descriptor_set = 2, binding = 1)] spheres: &[Vec4],
+  #[spirv(descriptor_set = 2, binding = 2)] sky: &Image2d,
+  #[spirv(descriptor_set = 3, binding = 0)] sampler: &Sampler,
 ) {
   let mut rng = Rng(id.x * consts.samples + id.y * consts.size.x);
   let uv = ((id.as_vec3().truncate() + rng.vec2()) / consts.size.as_vec2()) * 2.0 - Vec2::ONE;
+  let cam_pos = Vec3::ZERO;
   let mut ray = Ray {
-    origin: Vec3::ZERO,
+    origin: cam_pos,
     dir: -(uv * Vec2::new(consts.size.x as f32 / consts.size.y as f32, 1.0) * 0.7.tan())
       .extend(1.0),
   };
@@ -45,24 +49,89 @@ pub fn main(
     if closest.distance != f32::MAX {
       let material = materials[closest.mat as usize];
       color *= material.truncate();
+      // lambertian bsdf
+      let light = uniform_sample(closest.normal, &mut rng);
+      color *= lambert_brdf(material.truncate()) * closest.normal.dot(light) / uniform_pdf();
+
       ray.origin = closest.pos;
-      ray.dir = match material.w as u32 {
-        0 => closest.normal + rng.vec3_sphere().normalize(),
-        1 => reflect(ray.dir, closest.normal),
-        _ => break,
-      };
+      ray.dir = light;
+      // break;
+
+      // ray.dir = match material.w as u32 {
+      //   0 => closest.normal + rng.vec3_sphere(),
+      //   1 => reflect(ray.dir, closest.normal),
+      //   _ => break,
+      // };
     } else {
-      color *= Vec3::new(0.5, 0.7, 1.0);
+      color *= sky
+        .sample_by_lod(*sampler, sample_equirect(ray.dir), 1.0)
+        .truncate();
       break;
     };
   }
 
+  let weight = 1.0 / consts.samples as f32;
   // safety: this is our texel
-  unsafe { tex.write(id.truncate(), tex.read(id.truncate()) + color.extend(1.0)) };
+  unsafe {
+    tex.write(
+      id.truncate(),
+      tex.read(id.truncate()) * (1.0 - weight) + color.extend(1.0) * weight,
+    )
+  };
 }
 
 fn reflect(v: Vec3, n: Vec3) -> Vec3 {
   v - 2.0 * v.dot(n) * n
+}
+
+fn lambert_brdf(color: Vec3) -> Vec3 {
+  color * FRAC_1_PI
+}
+
+fn uniform_pdf() -> f32 {
+  FRAC_1_PI / 2.0
+}
+
+fn uniform_sample(n: Vec3, rng: &mut Rng) -> Vec3 {
+  let z = rng.f32();
+  let r = (1.0 - z * z).max(0.0).sqrt();
+  let phi = 2.0 * PI * rng.f32();
+  (n + Vec3::new(r * phi.cos(), r * phi.sin(), z)).normalize()
+}
+
+/// schlick approximation for dielectric fresnel
+fn schlick(cos: f32, ir: f32) -> f32 {
+  let r0 = ((1.0 - ir) / (1.0 + ir)).powf(2.0);
+  r0 + (1.0 - r0) * (1.0 - cos).powf(5.0)
+}
+
+fn ggx_distribution(nh: f32, a: f32) -> f32 {
+  let a2 = a * a;
+  let d = nh * nh * (a2 - 1.0) + 1.0;
+  a2 / (PI * d * d)
+}
+
+fn smith_vis(nv: f32, nl: f32, a: f32) -> f32 {
+  let v = nl * (nv * (1.0 - a) + a);
+  let l = nv * (nl * (1.0 - a) + a);
+
+  return 0.5 / (v + l);
+}
+
+pub fn orthonormal_basis(v: &Vec3) -> (Vec3, Vec3) {
+  // From https://graphics.pixar.com/library/OrthonormalB/paper.pdf
+  let sign = if v.z > 0.0 { 1.0 } else { 0.0 };
+  let a = -1.0 / (sign + v.z);
+  let b = v.x * v.y * a;
+  (
+    Vec3::new(1.0 + sign * v.x * v.x * a, sign * b, -sign * v.x),
+    Vec3::new(b, sign + v.y * v.y * a, -v.y),
+  )
+}
+
+/// given spherical coordinates returns equirectangular coordinates
+fn sample_equirect(dir: Vec3) -> Vec2 {
+  Vec2::new(dir.z.atan2(dir.x) + PI, dir.y.acos()) / Vec2::new(2.0 * PI, PI)
 }
 
 struct Ray {
